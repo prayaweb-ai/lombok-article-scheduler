@@ -1,0 +1,83 @@
+name: Lombok daily articles
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      check_only:
+        description: 'Verify connection without creating an article'
+        type: boolean
+        default: true
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: lombok-daily-articles
+  cancel-in-progress: false
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check random daily slots and run due article
+        env:
+          TARGET_URL: https://paketlombokwisata.com
+          CHECK_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.check_only }}
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          const base = process.env.TARGET_URL;
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          for (let call = 0; call < 3; call++) {
+            // GitHub supplies short-lived credentials. Never print them or
+            // store a shared password/API token in this public repository.
+            const identityUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+            identityUrl.searchParams.set("audience", base);
+            const identityResponse = await fetch(identityUrl, {
+              headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+              signal: AbortSignal.timeout(15000),
+            });
+            if (!identityResponse.ok) throw new Error(`Identity service: ${identityResponse.status}`);
+            const identity = await identityResponse.json();
+            const response = await fetch(`${base}/api/articles/automation/tick`, {
+              method: "POST",
+              headers: { Authorization: `Bearer ${identity.value}`, "Content-Type": "application/json" },
+              body: JSON.stringify({ checkOnly: process.env.CHECK_ONLY === "true" }),
+              signal: AbortSignal.timeout(250000),
+            });
+            if (!response.ok) throw new Error(`Website scheduler returned HTTP ${response.status}. Publish the scheduler code and check its configuration.`);
+            const lines = (await response.text()).trim().split("\n");
+            const result = JSON.parse(lines.at(-1));
+            console.log(JSON.stringify(result));
+            if (result.status === "waiting") {
+              if (!Number.isInteger(result.waitSeconds) || result.waitSeconds < 1 || result.waitSeconds > 1200) throw new Error("Invalid waiting interval");
+              await sleep(result.waitSeconds * 1000);
+              continue;
+            }
+            if (result.status === "failed") throw new Error("Article did not pass generation/checks. No partial article was published.");
+            if (result.status === "completed") continue;
+            if (!["idle", "busy", "verified"].includes(result.status)) throw new Error("Unexpected scheduler response");
+            break;
+          }
+          JS
+  keep-schedule-active:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 2
+    steps:
+      - name: Monthly activity prevents inactivity-based schedule disabling
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          if [ "$(date -u +%d)" != "01" ] || [ "$(date -u +%H)" != "04" ]; then exit 0; fi
+          old_sha="$(gh api "repos/$REPOSITORY/contents/scheduler-heartbeat.txt" --jq '.sha' 2>/dev/null || true)"
+          content="$(date -u +%Y-%m-%dT%H:%M:%SZ | base64 -w0)"
+          if [ -n "$old_sha" ]; then
+            gh api --method PUT "repos/$REPOSITORY/contents/scheduler-heartbeat.txt" -f message='Keep scheduler active' -f content="$content" -f sha="$old_sha" >/dev/null
+          else
+            gh api --method PUT "repos/$REPOSITORY/contents/scheduler-heartbeat.txt" -f message='Keep scheduler active' -f content="$content" >/dev/null
+          fi
